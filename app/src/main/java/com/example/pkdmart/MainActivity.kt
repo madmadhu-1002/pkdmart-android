@@ -1,11 +1,22 @@
 package com.example.pkdmart
 
+import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Application
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.location.Location
+import android.location.LocationManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -58,6 +69,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -66,6 +78,7 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
@@ -75,11 +88,7 @@ import com.example.pkdmart.ui.theme.PkdmartTheme
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
 import com.google.gson.reflect.TypeToken
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import androidx.datastore.preferences.core.edit
-import androidx.datastore.preferences.core.stringPreferencesKey
-import androidx.datastore.preferences.preferencesDataStore
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
 import retrofit2.http.GET
@@ -98,8 +107,10 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private val Context.dataStore by preferencesDataStore(name = "pkdmart_prefs")
-private val CART_JSON_KEY = stringPreferencesKey("cart_json")
+private const val PREFS_NAME = "pkdmart_prefs"
+private const val CART_JSON_KEY = "cart_json"
+private const val CHECKOUT_UPI_ID = "paytmqr18f80ytzoi@paytm"
+private const val CHECKOUT_MERCHANT_CATEGORY = "5411"
 
 // -------- API --------
 
@@ -193,7 +204,9 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     private fun loadCartFromDisk() {
         viewModelScope.launch {
             try {
-                val json = getApplication<Application>().applicationContext.dataStore.data.first()[CART_JSON_KEY]
+                val prefs = getApplication<Application>().applicationContext
+                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                val json = prefs.getString(CART_JSON_KEY, null)
                 if (!json.isNullOrBlank()) {
                     val type = object : TypeToken<Map<String, Int>>() {}.type
                     val map: Map<String, Int> = gson.fromJson(json, type) ?: emptyMap()
@@ -210,9 +223,9 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
             try {
                 val cleanMap = cartQuantities.filterValues { it > 0 }
                 val json = gson.toJson(cleanMap)
-                getApplication<Application>().applicationContext.dataStore.edit { prefs ->
-                    prefs[CART_JSON_KEY] = json
-                }
+                val prefs = getApplication<Application>().applicationContext
+                    .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                prefs.edit().putString(CART_JSON_KEY, json).apply()
             } catch (_: Exception) {
             }
         }
@@ -307,6 +320,31 @@ private val chipPalette = listOf(
     Color(0xFFE0F2F1)
 )
 
+private fun requiredRuntimePermissions(): Array<String> {
+    val permissions = mutableListOf(
+        Manifest.permission.ACCESS_COARSE_LOCATION,
+        Manifest.permission.ACCESS_FINE_LOCATION
+    )
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+    }
+    return permissions.toTypedArray()
+}
+
+@SuppressLint("MissingPermission")
+private fun readLastKnownCoordinates(context: Context): String? {
+    val fineGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+    val coarseGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+    if (!fineGranted && !coarseGranted) return null
+
+    val manager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return null
+    val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
+    val best: Location = providers.mapNotNull { provider -> runCatching { manager.getLastKnownLocation(provider) }.getOrNull() }
+        .maxByOrNull { it.time } ?: return null
+
+    return "Lat ${"%.6f".format(best.latitude)}, Lng ${"%.6f".format(best.longitude)}"
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PkdmartNativeApp() {
@@ -320,8 +358,31 @@ fun PkdmartNativeApp() {
     )
     var selectedTab by remember { mutableStateOf(0) }
     var productDetailOpen by remember { mutableStateOf(false) }
+    var locationText by remember { mutableStateOf("Location: requesting permission…") }
 
-    LaunchedEffect(Unit) { vm.load() }
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { grants ->
+        val locationGranted = grants[Manifest.permission.ACCESS_FINE_LOCATION] == true || grants[Manifest.permission.ACCESS_COARSE_LOCATION] == true
+        locationText = if (locationGranted) {
+            readLastKnownCoordinates(context)?.let { "Location: $it" } ?: "Location: enabled, waiting for GPS fix"
+        } else {
+            "Location permission denied"
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        vm.load()
+        val permissions = requiredRuntimePermissions()
+        val allGranted = permissions.all { permission ->
+            ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+        }
+        if (allGranted) {
+            locationText = readLastKnownCoordinates(context)?.let { "Location: $it" } ?: "Location: enabled, waiting for GPS fix"
+        } else {
+            permissionLauncher.launch(permissions)
+        }
+    }
 
     fun navigateToTab(tab: Int) {
         selectedTab = tab
@@ -347,6 +408,7 @@ fun PkdmartNativeApp() {
                         Column {
                             Text("PKD Mart", fontWeight = FontWeight.Bold)
                             Text("Delivery in 15 mins", style = MaterialTheme.typography.labelMedium, color = Color.Gray)
+                            Text(locationText, style = MaterialTheme.typography.labelSmall, color = Color(0xFF455A64), maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
                 }
@@ -528,7 +590,7 @@ private fun ProductRowCard(
             Column(modifier = Modifier.weight(1f)) {
                 Text(product.name, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(product.unit, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
-                Text(product.category, style = MaterialTheme.typography.labelSmall, color = Color(0xFF2E7D32))
+                Text(product.category, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
                 Text(product.price, fontWeight = FontWeight.Bold)
             }
 
@@ -547,11 +609,11 @@ private fun ProductRowCard(
                         onClick = onAdd,
                         shape = RoundedCornerShape(10.dp),
                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32))
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
                     ) { Text("+") }
                 }
             } else {
-                Button(onClick = onAdd, shape = RoundedCornerShape(12.dp), colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32))) {
+                Button(onClick = onAdd, shape = RoundedCornerShape(12.dp), colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)) {
                     Text("ADD")
                 }
             }
@@ -598,8 +660,12 @@ private fun ProductDetailScreen(
                             AsyncImage(
                                 model = p.imageUrl,
                                 contentDescription = p.name,
-                                modifier = Modifier.fillMaxWidth().height(220.dp).clip(RoundedCornerShape(14.dp)),
-                                contentScale = ContentScale.Crop
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(220.dp)
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(Color(0xFFF5F5F5)),
+                                contentScale = ContentScale.Fit
                             )
                         }
                         Text(p.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
@@ -623,13 +689,13 @@ private fun ProductDetailScreen(
                                     onClick = { vm.addToCart(p.id) },
                                     shape = RoundedCornerShape(10.dp),
                                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32))
+                                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
                                 ) { Text("+") }
                             }
                         } else {
                             Button(
                                 onClick = { vm.addToCart(p.id) },
-                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32))
+                                colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
                             ) {
                                 Text("ADD TO CART")
                             }
@@ -746,8 +812,33 @@ private fun CategoriesScreen(vm: HomeViewModel, modifier: Modifier = Modifier) {
     }
 }
 
+private fun launchUpiIntent(context: Context, amount: Int) {
+    val txId = "PKD${System.currentTimeMillis()}"
+    val uri = Uri.Builder()
+        .scheme("upi")
+        .authority("pay")
+        .appendQueryParameter("pa", CHECKOUT_UPI_ID)
+        .appendQueryParameter("pn", "Kosigi Mahidhar")
+        .appendQueryParameter("tn", "PKDMart Order")
+        .appendQueryParameter("mc", CHECKOUT_MERCHANT_CATEGORY)
+        .appendQueryParameter("tr", txId)
+        .appendQueryParameter("tid", txId)
+        .appendQueryParameter("am", amount.toString())
+        .appendQueryParameter("cu", "INR")
+        .build()
+
+    val intent = Intent(Intent.ACTION_VIEW, uri)
+    try {
+        context.startActivity(Intent.createChooser(intent, "Pay with UPI app"))
+    } catch (_: Exception) {
+        Toast.makeText(context, "No UPI app found on this device", Toast.LENGTH_SHORT).show()
+    }
+}
+
 @Composable
 private fun CartScreen(vm: HomeViewModel, modifier: Modifier = Modifier) {
+
+    val context = LocalContext.current
     val itemsInCart = vm.cartQuantities.mapNotNull { (id, qty) ->
         val product = vm.products.firstOrNull { it.id == id } ?: return@mapNotNull null
         product to qty.coerceAtLeast(1)
@@ -866,7 +957,7 @@ private fun CartScreen(vm: HomeViewModel, modifier: Modifier = Modifier) {
                             Text("₹$grandTotal", fontWeight = FontWeight.Bold)
                         }
                         if (delivery > 0) {
-                            Text("Add ₹${199 - subtotal} more for free delivery", style = MaterialTheme.typography.bodySmall, color = Color(0xFF2E7D32))
+                            Text("Add ₹${199 - subtotal} more for free delivery", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
                         }
                     }
                 }
@@ -880,9 +971,10 @@ private fun CartScreen(vm: HomeViewModel, modifier: Modifier = Modifier) {
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB0BEC5))
                     ) { Text("Clear Cart") }
                     Button(
-                        onClick = { },
+                        onClick = { launchUpiIntent(context, grandTotal) },
                         modifier = Modifier.weight(1f),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2E7D32))
+                        enabled = grandTotal > 0,
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
                     ) { Text("Checkout") }
                 }
             }
@@ -896,3 +988,4 @@ private fun SimpleTab(text: String, modifier: Modifier = Modifier) {
         Text(text, style = MaterialTheme.typography.titleMedium)
     }
 }
+
