@@ -12,6 +12,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Looper
+import android.os.SystemClock
 import android.widget.Toast
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
@@ -25,6 +26,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -456,6 +458,7 @@ fun PkdmartNativeApp() {
     var selectedTab by remember { mutableStateOf(0) }
     var productDetailOpen by remember { mutableStateOf(false) }
     var locationText by remember { mutableStateOf("Location: requesting permission…") }
+    var lastBackPressMs by remember { mutableStateOf(0L) }
     
     val fusedClient = remember { LocationServices.getFusedLocationProviderClient(context) }
     val locationCallback = remember {
@@ -507,6 +510,27 @@ fun PkdmartNativeApp() {
         if (productDetailOpen) {
             productDetailOpen = false
             vm.clearProductDetail()
+        }
+    }
+
+    BackHandler {
+        when {
+            productDetailOpen -> {
+                productDetailOpen = false
+                vm.clearProductDetail()
+            }
+            selectedTab != 0 -> {
+                selectedTab = 0
+            }
+            else -> {
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastBackPressMs < 2000) {
+                    (context as? ComponentActivity)?.moveTaskToBack(true)
+                } else {
+                    lastBackPressMs = now
+                    Toast.makeText(context, "Press back again to exit", Toast.LENGTH_SHORT).show()
+                }
+            }
         }
     }
 
