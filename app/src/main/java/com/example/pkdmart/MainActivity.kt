@@ -11,7 +11,14 @@ import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Looper
 import android.widget.Toast
+import com.google.android.gms.location.FusedLocationProviderClient
+import com.google.android.gms.location.LocationCallback
+import com.google.android.gms.location.LocationRequest
+import com.google.android.gms.location.LocationResult
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.location.Priority
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -67,7 +74,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.Modifier
@@ -91,7 +100,9 @@ import com.google.gson.reflect.TypeToken
 import kotlinx.coroutines.launch
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
+import retrofit2.http.Body
 import retrofit2.http.GET
+import retrofit2.http.POST
 import retrofit2.http.Path
 
 class MainActivity : ComponentActivity() {
@@ -111,6 +122,11 @@ private const val PREFS_NAME = "pkdmart_prefs"
 private const val CART_JSON_KEY = "cart_json"
 private const val CHECKOUT_UPI_ID = "paytmqr18f80ytzoi@paytm"
 private const val CHECKOUT_MERCHANT_CATEGORY = "5411"
+
+// PKDMart API checkout defaults
+private const val API_USER_ID = "68eba42b109343d1f25edc3c"
+private const val API_USER_NAME = "Mahi"
+private const val API_USER_MOBILE = "9000000000"
 
 // -------- API --------
 
@@ -146,6 +162,56 @@ data class ProductDetailResponse(
     val product: ProductDto
 )
 
+data class OrderModeResponse(
+    val isQuickActive: Boolean = false,
+    val isScheduledActive: Boolean = true
+)
+
+data class AddressLocationPayload(
+    val label: String,
+    val formattedAddress: String,
+    val street: String,
+    val city: String,
+    val state: String,
+    val zipCode: String,
+    val country: String,
+    val lat: Double,
+    val lng: Double,
+    val isDefault: Boolean = true
+)
+
+data class CreateOrderAddressPayload(
+    val name: String,
+    val mobile: String,
+    val location: AddressLocationPayload
+)
+
+data class CreateOrderItemPayload(
+    val productId: String,
+    val quantity: Int
+)
+
+data class CreateOrderRequest(
+    val userId: String,
+    val address: CreateOrderAddressPayload,
+    val paymentMethod: String = "cod",
+    val orderType: String,
+    val deliverySlot: String? = null,
+    val products: List<CreateOrderItemPayload>
+)
+
+data class CreatedOrderPayload(
+    @SerializedName("_id") val id: String? = null,
+    val redirectUrl: String? = null
+)
+
+data class CreateOrderResponse(
+    val success: Boolean = false,
+    val order: CreatedOrderPayload? = null,
+    val error: String? = null,
+    val otp: String? = null
+)
+
 interface PkdmartApi {
     @GET("api/categories")
     suspend fun getCategories(): CategoriesResponse
@@ -155,6 +221,12 @@ interface PkdmartApi {
 
     @GET("api/products/{id}")
     suspend fun getProductDetail(@Path("id") id: String): ProductDetailResponse
+
+    @GET("api/order-mode")
+    suspend fun getOrderMode(): OrderModeResponse
+
+    @POST("api/order/create-order")
+    suspend fun createOrder(@Body request: CreateOrderRequest): CreateOrderResponse
 }
 
 private object ApiClient {
@@ -332,11 +404,34 @@ private fun requiredRuntimePermissions(): Array<String> {
 }
 
 @SuppressLint("MissingPermission")
+private fun startLocationUpdates(
+    fusedClient: FusedLocationProviderClient,
+    callback: LocationCallback,
+    onUpdate: (String) -> Unit
+) {
+    val locationRequest = LocationRequest.Builder(
+        Priority.PRIORITY_HIGH_ACCURACY,
+        5000L
+    )
+        .setMinUpdateDistanceMeters(5f)
+        .build()
+    
+    fusedClient.requestLocationUpdates(locationRequest, callback, Looper.getMainLooper())
+}
+
+@SuppressLint("MissingPermission")
 private fun readLastKnownCoordinates(context: Context): String? {
     val fineGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
     val coarseGranted = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
     if (!fineGranted && !coarseGranted) return null
 
+    val fusedClient = LocationServices.getFusedLocationProviderClient(context)
+    fusedClient.lastLocation.addOnSuccessListener { location ->
+        if (location != null) {
+            // Callback will handle display
+        }
+    }
+    
     val manager = context.getSystemService(Context.LOCATION_SERVICE) as? LocationManager ?: return null
     val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
     val best: Location = providers.mapNotNull { provider -> runCatching { manager.getLastKnownLocation(provider) }.getOrNull() }
@@ -359,15 +454,28 @@ fun PkdmartNativeApp() {
     var selectedTab by remember { mutableStateOf(0) }
     var productDetailOpen by remember { mutableStateOf(false) }
     var locationText by remember { mutableStateOf("Location: requesting permission…") }
+    
+    val fusedClient = remember { LocationServices.getFusedLocationProviderClient(context) }
+    val locationCallback = remember {
+        object : LocationCallback() {
+            override fun onLocationResult(result: LocationResult) {
+                for (location in result.locations) {
+                    locationText = "📍 Lat ${"%.6f".format(location.latitude)}, Lng ${"%.6f".format(location.longitude)}"
+                }
+            }
+        }
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { grants ->
         val locationGranted = grants[Manifest.permission.ACCESS_FINE_LOCATION] == true || grants[Manifest.permission.ACCESS_COARSE_LOCATION] == true
-        locationText = if (locationGranted) {
-            readLastKnownCoordinates(context)?.let { "Location: $it" } ?: "Location: enabled, waiting for GPS fix"
+        if (locationGranted) {
+            startLocationUpdates(fusedClient, locationCallback) { coords ->
+                locationText = coords
+            }
         } else {
-            "Location permission denied"
+            locationText = "Location permission denied"
         }
     }
 
@@ -378,9 +486,17 @@ fun PkdmartNativeApp() {
             ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
         }
         if (allGranted) {
-            locationText = readLastKnownCoordinates(context)?.let { "Location: $it" } ?: "Location: enabled, waiting for GPS fix"
+            startLocationUpdates(fusedClient, locationCallback) { coords ->
+                locationText = coords
+            }
         } else {
             permissionLauncher.launch(permissions)
+        }
+    }
+    
+    DisposableEffect(Unit) {
+        onDispose {
+            fusedClient.removeLocationUpdates(locationCallback)
         }
     }
 
@@ -835,10 +951,50 @@ private fun launchUpiIntent(context: Context, amount: Int) {
     }
 }
 
+private val defaultApiAddress = AddressLocationPayload(
+    label = "Home",
+    formattedAddress = "APSRTC Bus Station, Pattikonda - Guntakal Rd, Pattikonda, Andhra Pradesh 518380, India",
+    street = "Pattikonda - Guntakal Road",
+    city = "Pattikonda",
+    state = "Andhra Pradesh",
+    zipCode = "518380",
+    country = "India",
+    lat = 15.3943402,
+    lng = 77.4983354,
+    isDefault = true
+)
+
+private suspend fun createServerOrder(itemsInCart: List<Pair<UiProduct, Int>>): CreateOrderResponse {
+    val mode = runCatching { ApiClient.api.getOrderMode() }.getOrNull()
+    val useQuick = mode?.isQuickActive == true
+    val orderType = if (useQuick) "quick" else "scheduled"
+    val slot = if (orderType == "scheduled") "6-8 am" else null
+
+    val payload = CreateOrderRequest(
+        userId = API_USER_ID,
+        address = CreateOrderAddressPayload(
+            name = API_USER_NAME,
+            mobile = API_USER_MOBILE,
+            location = defaultApiAddress
+        ),
+        paymentMethod = "cod",
+        orderType = orderType,
+        deliverySlot = slot,
+        products = itemsInCart.map { (product, qty) ->
+            CreateOrderItemPayload(productId = product.id, quantity = qty)
+        }
+    )
+
+    return ApiClient.api.createOrder(payload)
+}
+
 @Composable
 private fun CartScreen(vm: HomeViewModel, modifier: Modifier = Modifier) {
 
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var placingOrder by remember { mutableStateOf(false) }
+
     val itemsInCart = vm.cartQuantities.mapNotNull { (id, qty) ->
         val product = vm.products.firstOrNull { it.id == id } ?: return@mapNotNull null
         product to qty.coerceAtLeast(1)
@@ -971,11 +1127,44 @@ private fun CartScreen(vm: HomeViewModel, modifier: Modifier = Modifier) {
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB0BEC5))
                     ) { Text("Clear Cart") }
                     Button(
-                        onClick = { launchUpiIntent(context, grandTotal) },
+                        onClick = {
+                            scope.launch {
+                                placingOrder = true
+                                try {
+                                    val response = createServerOrder(itemsInCart)
+                                    if (response.success && response.order != null) {
+                                        vm.clearCart()
+                                        val redirectUrl = response.order.redirectUrl
+                                        if (!redirectUrl.isNullOrBlank()) {
+                                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(redirectUrl)))
+                                        }
+                                        Toast.makeText(
+                                            context,
+                                            "Order placed${response.order.id?.let { " (#$it)" } ?: ""}",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    } else {
+                                        Toast.makeText(
+                                            context,
+                                            response.error ?: "Order creation failed",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                } catch (e: Exception) {
+                                    Toast.makeText(
+                                        context,
+                                        e.message ?: "Unable to place order",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                } finally {
+                                    placingOrder = false
+                                }
+                            }
+                        },
                         modifier = Modifier.weight(1f),
-                        enabled = grandTotal > 0,
+                        enabled = grandTotal > 0 && !placingOrder,
                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-                    ) { Text("Checkout") }
+                    ) { Text(if (placingOrder) "Placing..." else "Checkout") }
                 }
             }
         }
