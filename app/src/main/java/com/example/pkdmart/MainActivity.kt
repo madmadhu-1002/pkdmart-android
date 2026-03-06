@@ -48,6 +48,7 @@ import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material.icons.filled.ShoppingCart
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -66,6 +67,7 @@ import androidx.compose.material3.SwipeToDismissBox
 import androidx.compose.material3.SwipeToDismissBoxState
 import androidx.compose.material3.SwipeToDismissBoxValue
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.runtime.Composable
@@ -964,7 +966,10 @@ private val defaultApiAddress = AddressLocationPayload(
     isDefault = true
 )
 
-private suspend fun createServerOrder(itemsInCart: List<Pair<UiProduct, Int>>): CreateOrderResponse {
+private suspend fun createServerOrder(
+    itemsInCart: List<Pair<UiProduct, Int>>,
+    paymentMethod: String
+): CreateOrderResponse {
     val mode = runCatching { ApiClient.api.getOrderMode() }.getOrNull()
     val useQuick = mode?.isQuickActive == true
     val orderType = if (useQuick) "quick" else "scheduled"
@@ -977,7 +982,7 @@ private suspend fun createServerOrder(itemsInCart: List<Pair<UiProduct, Int>>): 
             mobile = API_USER_MOBILE,
             location = defaultApiAddress
         ),
-        paymentMethod = "cod",
+        paymentMethod = paymentMethod,
         orderType = orderType,
         deliverySlot = slot,
         products = itemsInCart.map { (product, qty) ->
@@ -994,10 +999,46 @@ private fun CartScreen(vm: HomeViewModel, modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var placingOrder by remember { mutableStateOf(false) }
+    var showPaymentDialog by remember { mutableStateOf(false) }
 
     val itemsInCart = vm.cartQuantities.mapNotNull { (id, qty) ->
         val product = vm.products.firstOrNull { it.id == id } ?: return@mapNotNull null
         product to qty.coerceAtLeast(1)
+    }
+
+    fun placeOrder(paymentMethod: String) {
+        scope.launch {
+            placingOrder = true
+            try {
+                val response = createServerOrder(itemsInCart, paymentMethod)
+                if (response.success && response.order != null) {
+                    vm.clearCart()
+                    val redirectUrl = response.order.redirectUrl
+                    if (!redirectUrl.isNullOrBlank()) {
+                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(redirectUrl)))
+                    }
+                    Toast.makeText(
+                        context,
+                        "Order placed${response.order.id?.let { " (#$it)" } ?: ""}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                } else {
+                    Toast.makeText(
+                        context,
+                        response.error ?: "Order creation failed",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            } catch (e: Exception) {
+                Toast.makeText(
+                    context,
+                    e.message ?: "Unable to place order",
+                    Toast.LENGTH_LONG
+                ).show()
+            } finally {
+                placingOrder = false
+            }
+        }
     }
 
     val unavailableCount = vm.cartQuantities.size - itemsInCart.size
@@ -1127,47 +1168,40 @@ private fun CartScreen(vm: HomeViewModel, modifier: Modifier = Modifier) {
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFB0BEC5))
                     ) { Text("Clear Cart") }
                     Button(
-                        onClick = {
-                            scope.launch {
-                                placingOrder = true
-                                try {
-                                    val response = createServerOrder(itemsInCart)
-                                    if (response.success && response.order != null) {
-                                        vm.clearCart()
-                                        val redirectUrl = response.order.redirectUrl
-                                        if (!redirectUrl.isNullOrBlank()) {
-                                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(redirectUrl)))
-                                        }
-                                        Toast.makeText(
-                                            context,
-                                            "Order placed${response.order.id?.let { " (#$it)" } ?: ""}",
-                                            Toast.LENGTH_LONG
-                                        ).show()
-                                    } else {
-                                        Toast.makeText(
-                                            context,
-                                            response.error ?: "Order creation failed",
-                                            Toast.LENGTH_LONG
-                                        ).show()
-                                    }
-                                } catch (e: Exception) {
-                                    Toast.makeText(
-                                        context,
-                                        e.message ?: "Unable to place order",
-                                        Toast.LENGTH_LONG
-                                    ).show()
-                                } finally {
-                                    placingOrder = false
-                                }
-                            }
-                        },
+                        onClick = { showPaymentDialog = true },
                         modifier = Modifier.weight(1f),
                         enabled = grandTotal > 0 && !placingOrder,
                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
-                    ) { Text(if (placingOrder) "Placing..." else "Checkout") }
+                    ) { Text(if (placingOrder) "Placing..." else "Place Order") }
                 }
             }
         }
+    }
+
+    if (showPaymentDialog) {
+        AlertDialog(
+            onDismissRequest = { if (!placingOrder) showPaymentDialog = false },
+            title = { Text("Choose Payment Method") },
+            text = { Text("Select COD or PhonePe to continue") },
+            confirmButton = {
+                TextButton(
+                    enabled = !placingOrder,
+                    onClick = {
+                        showPaymentDialog = false
+                        placeOrder("phonepe")
+                    }
+                ) { Text("PhonePe") }
+            },
+            dismissButton = {
+                TextButton(
+                    enabled = !placingOrder,
+                    onClick = {
+                        showPaymentDialog = false
+                        placeOrder("cod")
+                    }
+                ) { Text("COD") }
+            }
+        )
     }
 }
 
