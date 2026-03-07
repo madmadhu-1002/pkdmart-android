@@ -2,6 +2,7 @@ package com.example.pkdmart
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.Activity
 import android.app.Application
 import android.content.Context
 import android.content.Intent
@@ -14,6 +15,9 @@ import android.os.Bundle
 import android.os.Looper
 import android.os.SystemClock
 import android.widget.Toast
+import com.google.android.gms.auth.api.signin.GoogleSignIn
+import com.google.android.gms.auth.api.signin.GoogleSignInOptions
+import com.google.android.gms.common.api.ApiException
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
@@ -131,6 +135,11 @@ private const val CHECKOUT_MERCHANT_CATEGORY = "5411"
 private const val API_USER_ID = "68eba42b109343d1f25edc3c"
 private const val API_USER_NAME = "Mahi"
 private const val API_USER_MOBILE = "9000000000"
+private const val GOOGLE_WEB_CLIENT_ID = "169534830935-mdubla6cq9q99r3jm424tudsepo41p9h.apps.googleusercontent.com"
+private const val AUTH_PREFS_NAME = "pkdmart_auth"
+private const val AUTH_USER_ID_KEY = "auth_user_id"
+private const val AUTH_USER_EMAIL_KEY = "auth_user_email"
+private const val AUTH_USER_NAME_KEY = "auth_user_name"
 
 // -------- API --------
 
@@ -216,6 +225,22 @@ data class CreateOrderResponse(
     val otp: String? = null
 )
 
+data class GoogleMobileAuthRequest(
+    val idToken: String
+)
+
+data class GoogleMobileAuthUser(
+    @SerializedName("_id") val id: String,
+    val email: String,
+    val name: String? = null
+)
+
+data class GoogleMobileAuthResponse(
+    val success: Boolean = false,
+    val user: GoogleMobileAuthUser? = null,
+    val error: String? = null
+)
+
 interface PkdmartApi {
     @GET("api/categories")
     suspend fun getCategories(): CategoriesResponse
@@ -231,6 +256,9 @@ interface PkdmartApi {
 
     @POST("api/order/create-order")
     suspend fun createOrder(@Body request: CreateOrderRequest): CreateOrderResponse
+
+    @POST("api/auth/google/mobile")
+    suspend fun googleMobileAuth(@Body request: GoogleMobileAuthRequest): GoogleMobileAuthResponse
 }
 
 private object ApiClient {
@@ -444,6 +472,25 @@ private fun readLastKnownCoordinates(context: Context): String? {
     return "Lat ${"%.6f".format(best.latitude)}, Lng ${"%.6f".format(best.longitude)}"
 }
 
+private fun googleStatusHint(code: Int): String = when (code) {
+    7 -> "NETWORK_ERROR"
+    8 -> "INTERNAL_ERROR"
+    10 -> "DEVELOPER_ERROR (check SHA-1/SHA-256 + OAuth client)"
+    13 -> "ERROR"
+    16 -> "CANCELED"
+    12500 -> "SIGN_IN_FAILED"
+    12501 -> "SIGN_IN_CANCELLED"
+    12502 -> "SIGN_IN_CURRENTLY_IN_PROGRESS"
+    else -> "UNKNOWN"
+}
+
+private enum class PendingAction {
+    NONE,
+    OPEN_CART,
+    OPEN_ORDERS,
+    ADD_TO_CART
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PkdmartNativeApp() {
@@ -459,7 +506,70 @@ fun PkdmartNativeApp() {
     var productDetailOpen by remember { mutableStateOf(false) }
     var locationText by remember { mutableStateOf("Location: requesting permission…") }
     var lastBackPressMs by remember { mutableStateOf(0L) }
-    
+    val appScope = rememberCoroutineScope()
+
+    val authPrefs = remember {
+        context.getSharedPreferences(AUTH_PREFS_NAME, Context.MODE_PRIVATE)
+    }
+    var authUserId by remember { mutableStateOf(authPrefs.getString(AUTH_USER_ID_KEY, null)) }
+    var authUserEmail by remember { mutableStateOf(authPrefs.getString(AUTH_USER_EMAIL_KEY, null)) }
+    var authUserName by remember { mutableStateOf(authPrefs.getString(AUTH_USER_NAME_KEY, null)) }
+    val isLoggedIn = !authUserId.isNullOrBlank()
+    var showLoginDialog by remember { mutableStateOf(false) }
+    var pendingAction by remember { mutableStateOf(PendingAction.NONE) }
+    var pendingAddProductId by remember { mutableStateOf<String?>(null) }
+    var authInProgress by remember { mutableStateOf(false) }
+
+    val gso = remember {
+        GoogleSignInOptions.Builder(GoogleSignInOptions.DEFAULT_SIGN_IN)
+            .requestEmail()
+            .requestIdToken(GOOGLE_WEB_CLIENT_ID)
+            .build()
+    }
+    val googleSignInClient = remember { GoogleSignIn.getClient(context, gso) }
+
+    fun runPendingActionAfterLogin() {
+        when (pendingAction) {
+            PendingAction.OPEN_CART -> selectedTab = 2
+            PendingAction.OPEN_ORDERS -> selectedTab = 3
+            PendingAction.ADD_TO_CART -> pendingAddProductId?.let { vm.addToCart(it) }
+            PendingAction.NONE -> {}
+        }
+        pendingAction = PendingAction.NONE
+        pendingAddProductId = null
+    }
+
+    fun persistAuth(userId: String, email: String?, name: String?) {
+        authPrefs.edit()
+            .putString(AUTH_USER_ID_KEY, userId)
+            .putString(AUTH_USER_EMAIL_KEY, email)
+            .putString(AUTH_USER_NAME_KEY, name)
+            .apply()
+        authUserId = userId
+        authUserEmail = email
+        authUserName = name
+    }
+
+    fun authenticateWithBackend(idToken: String, onSuccess: () -> Unit = {}) {
+        authInProgress = true
+        appScope.launch {
+            try {
+                val authRes = ApiClient.api.googleMobileAuth(GoogleMobileAuthRequest(idToken = idToken))
+                val userId = authRes.user?.id
+                if (authRes.success && !userId.isNullOrBlank()) {
+                    persistAuth(userId, authRes.user?.email, authRes.user?.name)
+                    onSuccess()
+                } else {
+                    Toast.makeText(context, authRes.error ?: "Login failed", Toast.LENGTH_LONG).show()
+                }
+            } catch (e: Exception) {
+                Toast.makeText(context, e.message ?: "Login failed", Toast.LENGTH_LONG).show()
+            } finally {
+                authInProgress = false
+            }
+        }
+    }
+
     val fusedClient = remember { LocationServices.getFusedLocationProviderClient(context) }
     val locationCallback = remember {
         object : LocationCallback() {
@@ -484,8 +594,59 @@ fun PkdmartNativeApp() {
         }
     }
 
+    val googleSignInLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode != Activity.RESULT_OK || result.data == null) {
+            val reason = if (result.resultCode == Activity.RESULT_CANCELED) "cancelled by user" else "resultCode=${result.resultCode}"
+            Toast.makeText(context, "Google sign-in not completed ($reason)", Toast.LENGTH_LONG).show()
+            return@rememberLauncherForActivityResult
+        }
+
+        try {
+            val task = GoogleSignIn.getSignedInAccountFromIntent(result.data)
+            val account = task.getResult(ApiException::class.java)
+            val idToken = account.idToken
+            if (idToken.isNullOrBlank()) {
+                Toast.makeText(context, "Google token missing", Toast.LENGTH_LONG).show()
+                return@rememberLauncherForActivityResult
+            }
+
+            authenticateWithBackend(idToken) {
+                Toast.makeText(context, "Signed in successfully", Toast.LENGTH_SHORT).show()
+                runPendingActionAfterLogin()
+            }
+        } catch (e: ApiException) {
+            Toast.makeText(
+                context,
+                "Google error: ${e.statusCode} (${googleStatusHint(e.statusCode)})",
+                Toast.LENGTH_LONG
+            ).show()
+        } catch (e: Exception) {
+            Toast.makeText(context, e.message ?: "Google sign-in failed", Toast.LENGTH_LONG).show()
+        }
+    }
+
     LaunchedEffect(Unit) {
         vm.load()
+
+        // Auto Google Sign-In like tutorial flow (if Google account already authorized)
+        if (authUserId.isNullOrBlank()) {
+            val lastAccount = GoogleSignIn.getLastSignedInAccount(context)
+            val cachedToken = lastAccount?.idToken
+            if (!cachedToken.isNullOrBlank()) {
+                authenticateWithBackend(cachedToken)
+            } else {
+                googleSignInClient.silentSignIn()
+                    .addOnSuccessListener { acct ->
+                        val token = acct.idToken
+                        if (!token.isNullOrBlank() && authUserId.isNullOrBlank()) {
+                            authenticateWithBackend(token)
+                        }
+                    }
+            }
+        }
+
         val permissions = requiredRuntimePermissions()
         val allGranted = permissions.all { permission ->
             ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
@@ -511,6 +672,21 @@ fun PkdmartNativeApp() {
             productDetailOpen = false
             vm.clearProductDetail()
         }
+    }
+
+    fun requestLoginFor(action: PendingAction, productId: String? = null) {
+        if (isLoggedIn) {
+            when (action) {
+                PendingAction.OPEN_CART -> navigateToTab(2)
+                PendingAction.OPEN_ORDERS -> navigateToTab(3)
+                PendingAction.ADD_TO_CART -> productId?.let { vm.addToCart(it) }
+                PendingAction.NONE -> {}
+            }
+            return
+        }
+        pendingAction = action
+        pendingAddProductId = productId
+        showLoginDialog = true
     }
 
     BackHandler {
@@ -550,6 +726,18 @@ fun PkdmartNativeApp() {
                         Column {
                             Text("PKD Mart", fontWeight = FontWeight.Bold)
                             Text("Delivery in 15 mins", style = MaterialTheme.typography.labelMedium, color = Color.Gray)
+                            if (isLoggedIn) {
+                                val nameOrEmail = authUserName?.takeIf { it.isNotBlank() } ?: authUserEmail
+                                if (!nameOrEmail.isNullOrBlank()) {
+                                    Text(
+                                        "Hi, $nameOrEmail",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = Color(0xFF2E7D32),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
                             Text(locationText, style = MaterialTheme.typography.labelSmall, color = Color(0xFF455A64), maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                     }
@@ -562,11 +750,16 @@ fun PkdmartNativeApp() {
                 NavigationBarItem(selected = selectedTab == 1, onClick = { navigateToTab(1) }, icon = { Icon(Icons.AutoMirrored.Filled.List, null) }, label = { Text("Categories") })
                 NavigationBarItem(
                     selected = selectedTab == 2,
-                    onClick = { navigateToTab(2) },
+                    onClick = { requestLoginFor(PendingAction.OPEN_CART) },
                     icon = { Icon(Icons.Default.ShoppingCart, null) },
                     label = { Text(if (vm.cartCount() > 0) "Cart (${vm.cartCount()})" else "Cart") }
                 )
-                NavigationBarItem(selected = selectedTab == 3, onClick = { navigateToTab(3) }, icon = { Icon(Icons.Default.Menu, null) }, label = { Text("Orders") })
+                NavigationBarItem(
+                    selected = selectedTab == 3,
+                    onClick = { requestLoginFor(PendingAction.OPEN_ORDERS) },
+                    icon = { Icon(Icons.Default.Menu, null) },
+                    label = { Text("Orders") }
+                )
             }
         }
     ) { innerPadding ->
@@ -577,6 +770,10 @@ fun PkdmartNativeApp() {
                 onBack = {
                     productDetailOpen = false
                     vm.clearProductDetail()
+                },
+                isLoggedIn = isLoggedIn,
+                onRequireLoginAddToCart = { productId ->
+                    requestLoginFor(PendingAction.ADD_TO_CART, productId)
                 }
             )
         } else {
@@ -587,13 +784,46 @@ fun PkdmartNativeApp() {
                     onProductClick = { id ->
                         productDetailOpen = true
                         vm.loadProductDetail(id)
-                    }
+                    },
+                    onRequireLoginAddToCart = { productId ->
+                        requestLoginFor(PendingAction.ADD_TO_CART, productId)
+                    },
+                    isLoggedIn = isLoggedIn
                 )
                 1 -> CategoriesScreen(vm, Modifier.padding(innerPadding))
-                2 -> CartScreen(vm, Modifier.padding(innerPadding))
+                2 -> CartScreen(vm, Modifier.padding(innerPadding), currentUserId = authUserId)
                 else -> SimpleTab("No orders yet", Modifier.padding(innerPadding))
             }
         }
+    }
+
+    if (showLoginDialog) {
+        AlertDialog(
+            onDismissRequest = {
+                showLoginDialog = false
+                pendingAction = PendingAction.NONE
+                pendingAddProductId = null
+            },
+            title = { Text("Login required") },
+            text = { Text("Please sign in with Google to continue") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        showLoginDialog = false
+                        googleSignInLauncher.launch(googleSignInClient.signInIntent)
+                    }
+                ) { Text(if (authInProgress) "Signing in..." else "Sign in") }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showLoginDialog = false
+                        pendingAction = PendingAction.NONE
+                        pendingAddProductId = null
+                    }
+                ) { Text("Cancel") }
+            }
+        )
     }
 }
 
@@ -601,7 +831,9 @@ fun PkdmartNativeApp() {
 private fun HomeScreen(
     vm: HomeViewModel,
     modifier: Modifier = Modifier,
-    onProductClick: (String) -> Unit = {}
+    onProductClick: (String) -> Unit = {},
+    onRequireLoginAddToCart: (String) -> Unit = {},
+    isLoggedIn: Boolean = true
 ) {
     var search by remember { mutableStateOf("") }
     var selectedCategory by remember { mutableStateOf("All") }
@@ -689,7 +921,10 @@ private fun HomeScreen(
             ProductRowCard(
                 product,
                 onClick = { onProductClick(product.id) },
-                onAdd = { vm.addToCart(product.id) },
+                onAdd = {
+                    if (isLoggedIn) vm.addToCart(product.id)
+                    else onRequireLoginAddToCart(product.id)
+                },
                 onDecrement = { vm.decrementFromCart(product.id) },
                 cartQty = vm.cartQuantities[product.id] ?: 0
             )
@@ -767,7 +1002,9 @@ private fun ProductRowCard(
 private fun ProductDetailScreen(
     vm: HomeViewModel,
     modifier: Modifier = Modifier,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    isLoggedIn: Boolean = true,
+    onRequireLoginAddToCart: (String) -> Unit = {}
 ) {
     val detail = vm.selectedProductDetail
 
@@ -828,7 +1065,10 @@ private fun ProductDetailScreen(
                                 ) { Text("-") }
                                 Text(currentQty.toString(), fontWeight = FontWeight.Bold)
                                 Button(
-                                    onClick = { vm.addToCart(p.id) },
+                                    onClick = {
+                                        if (isLoggedIn) vm.addToCart(p.id)
+                                        else onRequireLoginAddToCart(p.id)
+                                    },
                                     shape = RoundedCornerShape(10.dp),
                                     contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp),
                                     colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
@@ -836,7 +1076,10 @@ private fun ProductDetailScreen(
                             }
                         } else {
                             Button(
-                                onClick = { vm.addToCart(p.id) },
+                                onClick = {
+                                    if (isLoggedIn) vm.addToCart(p.id)
+                                    else onRequireLoginAddToCart(p.id)
+                                },
                                 colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.primary)
                             ) {
                                 Text("ADD TO CART")
@@ -991,6 +1234,7 @@ private val defaultApiAddress = AddressLocationPayload(
 )
 
 private suspend fun createServerOrder(
+    userId: String,
     itemsInCart: List<Pair<UiProduct, Int>>,
     paymentMethod: String
 ): CreateOrderResponse {
@@ -1000,7 +1244,7 @@ private suspend fun createServerOrder(
     val slot = if (orderType == "scheduled") "6-8 am" else null
 
     val payload = CreateOrderRequest(
-        userId = API_USER_ID,
+        userId = userId,
         address = CreateOrderAddressPayload(
             name = API_USER_NAME,
             mobile = API_USER_MOBILE,
@@ -1018,7 +1262,11 @@ private suspend fun createServerOrder(
 }
 
 @Composable
-private fun CartScreen(vm: HomeViewModel, modifier: Modifier = Modifier) {
+private fun CartScreen(
+    vm: HomeViewModel,
+    modifier: Modifier = Modifier,
+    currentUserId: String? = null
+) {
 
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -1029,12 +1277,13 @@ private fun CartScreen(vm: HomeViewModel, modifier: Modifier = Modifier) {
         val product = vm.products.firstOrNull { it.id == id } ?: return@mapNotNull null
         product to qty.coerceAtLeast(1)
     }
+    val effectiveUserId = currentUserId ?: API_USER_ID
 
     fun placeOrder(paymentMethod: String) {
         scope.launch {
             placingOrder = true
             try {
-                val response = createServerOrder(itemsInCart, paymentMethod)
+                val response = createServerOrder(effectiveUserId, itemsInCart, paymentMethod)
                 if (response.success && response.order != null) {
                     vm.clearCart()
                     val redirectUrl = response.order.redirectUrl
